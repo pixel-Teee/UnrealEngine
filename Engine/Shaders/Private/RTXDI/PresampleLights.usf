@@ -1,0 +1,278 @@
+/*
+* Copyright (c) 2021 NVIDIA CORPORATION.  All rights reserved.
+*
+* NVIDIA Corporation and its licensors retain all intellectual property and proprietary
+* rights in and to this software, related documentation and any modifications thereto.
+* Any use, reproduction, disclosure or distribution of this software and related
+* documentation without an express license agreement from NVIDIA Corporation is strictly
+* prohibited.
+*
+* TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THIS SOFTWARE IS PROVIDED *AS IS*
+* AND NVIDIA AND ITS SUPPLIERS DISCLAIM ALL WARRANTIES, EITHER EXPRESS OR IMPLIED,
+* INCLUDING, BUT NOT LIMITED TO, IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+* PARTICULAR PURPOSE.  IN NO EVENT SHALL NVIDIA OR ITS SUPPLIERS BE LIABLE FOR ANY
+* SPECIAL, INCIDENTAL, INDIRECT, OR CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, WITHOUT
+* LIMITATION, DAMAGES FOR LOSS OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF
+* BUSINESS INFORMATION, OR ANY OTHER PECUNIARY LOSS) ARISING OUT OF THE USE OF OR
+* INABILITY TO USE THIS SOFTWARE, EVEN IF NVIDIA HAS BEEN ADVISED OF THE POSSIBILITY OF
+* SUCH DAMAGES.
+*/
+
+#include "../Common.ush"
+
+#define SUPPORT_CONTACT_SHADOWS		0
+#define USE_SOURCE_TEXTURE_ARRAY	1
+
+#define LTCMatTexture				SampledLightData.LTCMatTexture
+#define LTCMatSampler				GlobalBilinearClampedSampler
+#define LTCAmpTexture				SampledLightData.LTCAmpTexture
+#define LTCAmpSampler				GlobalBilinearClampedSampler
+#define PreIntegratedGF				ReflectionStruct.PreIntegratedGF
+#define PreIntegratedGFSampler		GlobalBilinearClampedSampler
+
+#include "DirectLightSamplingCommon.ush"
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+int PdfTexDimensions;
+int MaxMipLevel;
+int RisTileSize;
+int UseWeightedSampling;
+int CreateBaseLevel;
+
+RWTexture2D<float> LightPdfUAV0;
+RWTexture2D<float> LightPdfUAV1;
+RWTexture2D<float> LightPdfUAV2;
+RWTexture2D<float> LightPdfUAV3;
+RWTexture2D<float> LightPdfUAV4;
+
+Texture2D<float> LightPdfTexture;
+
+RWBuffer<uint2> RisBuffer;
+
+//Present code requires 16x16 group dimensions
+#define RTXDI_PDF_SAMPLING_GROUP_SIZE 16
+#define RTXDI_PRESAMPLING_GROUP_SIZE 256
+
+groupshared float Cache[RTXDI_PDF_SAMPLING_GROUP_SIZE][RTXDI_PDF_SAMPLING_GROUP_SIZE];
+
+[numthreads(RTXDI_PDF_SAMPLING_GROUP_SIZE, RTXDI_PDF_SAMPLING_GROUP_SIZE, 1)]
+void ComputeLightPdfCS(uint3 GroupIndex : SV_GroupID, uint3 LocalIndex : SV_GroupThreadID)
+{
+	uint2 Cell = LocalIndex.xy + GroupIndex.xy * RTXDI_PDF_SAMPLING_GROUP_SIZE;
+
+	float Pdf = 0.0;
+
+	uint ActiveWidth = min(PdfTexDimensions, RTXDI_PDF_SAMPLING_GROUP_SIZE);
+
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		if (CreateBaseLevel)
+		{
+			// creating top-level data from the lights
+			uint LightID = Cell.y * PdfTexDimensions + Cell.x;
+
+			if (LightID < SampledLightData.LocalLightCount)
+			{
+				if (UseWeightedSampling)
+				{
+					Pdf = GetLightPower(LightID + SampledLightData.DirectionalLightCount);
+				}
+				else
+				{
+					Pdf = 1.0f; // equal weights
+				}
+			}
+		}
+		else
+		{
+			// fetching from the previous level and downsampling
+			uint2 SampleBase = Cell * 2;
+			
+			Pdf = LightPdfTexture.Load(int3(SampleBase + uint2(0, 0), 0));
+			Pdf += LightPdfTexture.Load(int3(SampleBase + uint2(0, 1), 0));
+			Pdf += LightPdfTexture.Load(int3(SampleBase + uint2(1, 0), 0));
+			Pdf += LightPdfTexture.Load(int3(SampleBase + uint2(1, 1), 0));
+
+			Pdf *= 0.25;
+		}
+
+		LightPdfUAV0[Cell] = Pdf;
+	}
+
+	// always write to the entire cache
+	Cache[LocalIndex.y][LocalIndex.x] = Pdf;
+
+	// The following is manually unrolled to handle UE4 shader limitations
+	//   * UAVs can only be a single mip level
+	//   * arrays of UAVs are not supported
+	//   * GroupSync barriers inside uniform control flow aren't supported by all shader compilers
+
+	ActiveWidth = ActiveWidth / 2;
+
+	GroupMemoryBarrierWithGroupSync();
+
+	// 8x8
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		uint2 SourceCell = LocalIndex * 2;
+		Pdf = Cache[SourceCell.y][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y][SourceCell.x + 1] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x + 1] * 0.25;
+		LightPdfUAV1[LocalIndex.xy + GroupIndex.xy*ActiveWidth] = Pdf;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		Cache[LocalIndex.y][LocalIndex.x] = Pdf;
+	}
+	ActiveWidth = ActiveWidth / 2;
+	GroupMemoryBarrierWithGroupSync();
+
+	// 4x4
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		uint2 SourceCell = LocalIndex * 2;
+		Pdf = Cache[SourceCell.y][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y][SourceCell.x + 1] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x + 1] * 0.25;
+		LightPdfUAV2[LocalIndex.xy + GroupIndex.xy * ActiveWidth] = Pdf;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (all(LocalIndex.xy < ActiveWidth))
+	{
+		Cache[LocalIndex.y][LocalIndex.x] = Pdf;
+	}
+	ActiveWidth = ActiveWidth / 2;
+	GroupMemoryBarrierWithGroupSync();
+
+	// 2x2
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		uint2 SourceCell = LocalIndex * 2;
+		Pdf = Cache[SourceCell.y][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y][SourceCell.x + 1] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x + 1] * 0.25;
+		LightPdfUAV3[LocalIndex.xy + GroupIndex.xy * ActiveWidth] = Pdf;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		Cache[LocalIndex.y][LocalIndex.x] = Pdf;
+	}
+	ActiveWidth = ActiveWidth / 2;
+	GroupMemoryBarrierWithGroupSync();
+
+	// 1x1
+	if (all(LocalIndex.xy < ActiveWidth.xx))
+	{
+		uint2 SourceCell = LocalIndex * 2;
+		Pdf = Cache[SourceCell.y][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y][SourceCell.x + 1] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x] * 0.25;
+		Pdf += Cache[SourceCell.y + 1][SourceCell.x + 1] * 0.25;
+		LightPdfUAV4[LocalIndex.xy + GroupIndex.xy * ActiveWidth] = Pdf;
+	}
+}
+
+void SamplePdfMipmap(
+	inout FRandomContext RandContext,
+	out uint2 position,
+	out float pdf)
+{
+
+	position = 0;
+	pdf = 1.0;
+
+	for (int mipLevel = MaxMipLevel-1; mipLevel >= 0; mipLevel--)
+	{
+		position *= 2;
+
+		float4 samples; // there's no version of Gather that supports mipmaps, really?
+		samples.x = LightPdfTexture.Load(int3(position + uint2(0, 0), mipLevel));
+		samples.y = LightPdfTexture.Load(int3(position + uint2(0, 1), mipLevel));
+		samples.z = LightPdfTexture.Load(int3(position + uint2(1, 0), mipLevel));
+		samples.w = LightPdfTexture.Load(int3(position + uint2(1, 1), mipLevel));
+
+		float weightSum = samples.x + samples.y + samples.z + samples.w;
+		if (weightSum <= 0)
+		{
+			pdf = 0;
+			return;
+		}
+
+		samples /= weightSum;
+
+		float rnd = RandContext.GenerateSample1D();
+
+		int2 selectedOffset;
+
+		if (rnd < samples.x)
+		{
+			pdf *= samples.x;
+		}
+		else
+		{
+			rnd -= samples.x;
+
+			if (rnd < samples.y)
+			{
+				position += uint2(0, 1);
+				pdf *= samples.y;
+			}
+			else
+			{
+				rnd -= samples.y;
+
+				if (rnd < samples.z)
+				{
+					position += uint2(1, 0);
+					pdf *= samples.z;
+				}
+				else
+				{
+					position += uint2(1, 1);
+					pdf *= samples.w;
+				}
+			}
+		}
+	}
+}
+
+[numthreads(RTXDI_PRESAMPLING_GROUP_SIZE, 1, 1)]
+void PreSampleLightsCS(uint3 DispatchIndex : SV_DispatchThreadID)
+{
+	if (DispatchIndex.x >= RisTileSize)
+		return;
+
+	int LinearIndex = DispatchIndex.x + DispatchIndex.y * RisTileSize;
+
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex);
+
+	uint2 texelPosition;
+	float pdf;
+	SamplePdfMipmap(RandContext, texelPosition, pdf);
+
+	uint lightIndex = texelPosition.x + texelPosition.y* PdfTexDimensions;
+
+	uint risBufferPtr = DispatchIndex.x + DispatchIndex.y * RisTileSize;
+
+	float invSourcePdf = 0;
+
+	if (pdf > 0)
+	{
+		invSourcePdf = 1.0 / pdf;
+		// Potentially attempt to store light into special compacted list
+	}
+
+
+	// Store the index of the light that we found and its inverse pdf.
+	// Or zero and zero if we somehow found nothing.
+	RisBuffer[risBufferPtr] = uint2(lightIndex, asuint(invSourcePdf));
+}

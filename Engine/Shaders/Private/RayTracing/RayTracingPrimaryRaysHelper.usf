@@ -1,0 +1,398 @@
+// Copyright 1998-2019 Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#define SUPPORT_CONTACT_SHADOWS		0
+#include "../DeferredLightingCommon.ush"
+
+RWTexture2D<float4> OutputColor;
+Texture2D<float4> InputColor1;
+Texture2D<float4> InputColor;
+
+Texture2D<uint2> SceneStencilTexture;
+uint CompositeMode;
+
+[numthreads(32, 32, 1)]
+void CompositeSeparateTranslucency_CS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint2 TextureCoord = DTid.xy;
+	float4 OutColor = 0;
+
+	float4 Color0 = InputColor.Load(int3(TextureCoord, 0));
+	uint Stencil = SceneStencilTexture.Load(int3(TextureCoord.xy, 0)) STENCIL_COMPONENT_SWIZZLE;
+	if (Stencil <= 0 && CompositeMode > 0)
+	{
+		OutColor = Color0;
+	}
+	else
+	{
+		float4 Color1 = InputColor1.Load(int3(TextureCoord, 0));
+		bool bDirty = Color1.w > -0.999f;
+		OutColor = bDirty ? Color1 : Color0;
+	}
+	OutputColor[TextureCoord] = OutColor;
+}
+
+int4 UseReconstructionInfo;
+uint FrameInfo;
+int PrimaryRaysHalfRes;
+
+Texture2D ReconstructionInfo;
+Texture2D SceneDepthTexture;
+Texture2D SceneNormalTexture;
+Texture2D SceneBaseColorTexture;
+
+#define ROUND_TEXCOORD(texcoord) (UseReconstructionInfo.w > 0 ? round(texcoord) : texcoord)
+#define USE_RECOVERED_TEXCOORD (UseReconstructionInfo.x > 0)
+#define SHOW_RECONTRUCTION_INFO UseReconstructionInfo.y
+#define RECONSTRUCTION_ALGO_MODE UseReconstructionInfo.z
+
+#define TEXCOORD_OFFSET0 int2(-1, 0)
+#define TEXCOORD_OFFSET1 int2(1, 0)
+#define TEXCOORD_OFFSET2 int2(0, 1)
+#define TEXCOORD_OFFSET3 int2(0, -1)
+
+#define HALFRES_CHECKERBOARD_WEIGHTED 1
+#define HALFRES_CHECKERBOARD_INTERFRAME 2
+#define HALFRES_CHECKERBOARD_AVERAGE 3
+
+static const float GSmallNumber = 0.0001f;
+
+float4 GetRecoveredTextureCoordAndHitDistance(uint2 TextureCoord)
+{
+	float4 Data0 = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET0, 0));
+	float4 Data1 = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET1, 0));
+	float4 Data2 = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET2, 0));
+	float4 Data3 = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET3, 0));
+
+	float2 RecoveredTextureCoord = Data0.xy * Data0.z
+								+ Data1.xy * Data1.z
+								+ Data2.xy * Data2.z
+								+ Data3.xy * Data3.z;
+
+	float SumWeight = Data0.z + Data1.z + Data2.z + Data3.z;
+
+	RecoveredTextureCoord /= SumWeight;
+
+	float MaxHitDistance = max(Data0.w, max(Data1.w, max(Data2.w, Data3.w)));
+	float MinHitDistance = min(Data0.w, min(Data1.w, min(Data2.w, Data3.w)));
+	float HitDistance = 0.5f * (Data0.w + Data1.w + Data2.w + Data3.w - MaxHitDistance - MinHitDistance);
+
+	return float4(RecoveredTextureCoord, SumWeight, HitDistance);
+}
+
+float4 GetColorWeights(in Texture2D<float4> InputTex, uint2 TextureCoord, 
+						inout float4 Data0, inout float4 Data1, inout float4 Data2, inout float4 Data3)
+{
+	float4 ColorWeights = 0;
+
+	Data0 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET0, 0));
+	Data1 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET1, 0));
+	Data2 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET2, 0));
+	Data3 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET3, 0));
+
+	float ColorLength0 = length(Data0.xyz);
+	float ColorLength1 = length(Data1.xyz);
+	float ColorLength2 = length(Data2.xyz);
+	float ColorLength3 = length(Data3.xyz);
+
+	float MaxColorLength = max(ColorLength0, max(ColorLength1, max(ColorLength2, ColorLength3)));
+	float MinColorLength = min(ColorLength0, min(ColorLength1, min(ColorLength2, ColorLength3)));
+	float MiddleColorLength = 0.5f * (ColorLength0 + ColorLength1 + ColorLength2 + ColorLength3 - MaxColorLength - MinColorLength);
+
+	ColorWeights = float4(1.0f / (abs(ColorLength0 - MiddleColorLength) + GSmallNumber),
+							1.0f / (abs(ColorLength1 - MiddleColorLength) + GSmallNumber),
+							1.0f / (abs(ColorLength2 - MiddleColorLength) + GSmallNumber),
+							1.0f / (abs(ColorLength3 - MiddleColorLength) + GSmallNumber)
+						);
+
+	return ColorWeights;
+}
+
+float GetSceneDepth(uint2 TextureCoord)
+{
+	float DeviceZ = SceneDepthTexture.Load(int3(TextureCoord, 0));
+	return ConvertFromDeviceZ(DeviceZ);
+}
+
+float GetNeighborWeight(inout float4 Color, float inDepth, int inStencil, float inHitDistance, float3 inBaseColor, float inColorWeight, in Texture2D<float4> InputTex, uint2 TextureCoord)
+{
+	float Weight = 1.0f;
+
+	if (PrimaryRaysHalfRes == HALFRES_CHECKERBOARD_WEIGHTED)
+	{
+		Weight = GSmallNumber;
+
+		float4 ReconstructionData = ReconstructionInfo.Load(int3(TextureCoord, 0));
+		float3 RecoveredTextureCoord = ReconstructionData.xyz;
+		int2 GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+
+		int Stencil = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+		float SceneDepth = GetSceneDepth(GBufferTextureCoord);
+		float HitDistance = ReconstructionData.w;
+		float3 BaseColor = DecodeBaseColor(SceneBaseColorTexture.Load(int3(GBufferTextureCoord, 0)).xyz);
+
+		if (Stencil > 0 && Stencil == inStencil)
+		{
+			float DepthWeight = 1.0f / (abs(SceneDepth - inDepth) + GSmallNumber);
+			float HitDistanceWeight = 1.0f / (abs(HitDistance - inHitDistance) + GSmallNumber);
+			float BaseColorWeight = 1.0f / (length(BaseColor - inBaseColor) + GSmallNumber);
+			switch (RECONSTRUCTION_ALGO_MODE)
+			{
+			case 1:
+				Weight += BaseColorWeight * inColorWeight * DepthWeight * HitDistanceWeight;
+				break;
+			default:
+				Weight += inColorWeight * DepthWeight * HitDistanceWeight;
+				break;
+			}
+		}
+	}
+
+	return Weight;
+}
+
+
+float4 GetReconstructedColor(in Texture2D<float4> InputTex, uint2 TextureCoord)
+{
+	float4 FinalColor = 0;
+	float SumWeight = 0;
+	float Weight = 0;
+
+	float4 ReconstructionData = GetRecoveredTextureCoordAndHitDistance(TextureCoord);
+	float3 RecoveredTextureCoord = ReconstructionData.xyz;
+	int2 GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+
+	int Stencil0 = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+	float SceneDepth0 = GetSceneDepth(GBufferTextureCoord);
+	float HitDistance0 = ReconstructionData.w;
+	float3 BaseColor0 = DecodeBaseColor(SceneBaseColorTexture.Load(int3(GBufferTextureCoord, 0)).xyz);
+
+	float4 NeighborColor0 = 0;
+	float4 NeighborColor1 = 0;
+	float4 NeighborColor2 = 0;
+	float4 NeighborColor3 = 0;
+
+	float4 ColoWeights = GetColorWeights(InputTex, TextureCoord,
+											NeighborColor0,
+											NeighborColor1,
+											NeighborColor2,
+											NeighborColor3);
+
+	int2 NewTextureCoord = TextureCoord + TEXCOORD_OFFSET0;
+	{
+		Weight = GetNeighborWeight(NeighborColor0, SceneDepth0, Stencil0, HitDistance0, BaseColor0, ColoWeights.x, InputTex, NewTextureCoord);
+		FinalColor += Weight * NeighborColor0;
+		SumWeight += Weight;
+	}
+
+	NewTextureCoord = TextureCoord + TEXCOORD_OFFSET1;
+	{
+		Weight = GetNeighborWeight(NeighborColor1, SceneDepth0, Stencil0, HitDistance0, BaseColor0, ColoWeights.y, InputTex, NewTextureCoord);
+		FinalColor += Weight * NeighborColor1;
+		SumWeight += Weight;
+	}
+
+	NewTextureCoord = TextureCoord + TEXCOORD_OFFSET2;
+	{
+		Weight = GetNeighborWeight(NeighborColor2, SceneDepth0, Stencil0, HitDistance0, BaseColor0, ColoWeights.z, InputTex, NewTextureCoord);
+		FinalColor += Weight * NeighborColor2;
+		SumWeight += Weight;
+	}
+
+	NewTextureCoord = TextureCoord + TEXCOORD_OFFSET3;
+	{
+		Weight = GetNeighborWeight(NeighborColor3, SceneDepth0, Stencil0, HitDistance0, BaseColor0, ColoWeights.w, InputTex, NewTextureCoord);
+		FinalColor += Weight * NeighborColor3;
+		SumWeight += Weight;
+	}
+
+	if (SumWeight > 0)
+	{
+		FinalColor /= SumWeight;
+	}
+
+	return FinalColor;
+}
+
+[numthreads(32, 32, 1)]
+void ReconstructSeparateTranslucency_CS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint2 TextureCoord = DTid.xy;
+
+	float4 Color0 = InputColor.Load(int3(TextureCoord, 0));
+
+	float4 FinalColor = 0;
+
+#if PRIMARYRAYS_HALFRES_MODE == HALFRES_CHECKERBOARD_INTERFRAME
+	{
+		float4 Color1 = InputColor1.Load(int3(TextureCoord, 0));
+		if (TextureCoord.y % 2 == FrameInfo)
+		{
+			FinalColor = (TextureCoord.x % 2 == 0) ? Color0 : Color1;
+		}
+		else
+		{
+			FinalColor = (TextureCoord.x % 2 == 0) ? Color1 : Color0;
+		}
+	}
+#elif (PRIMARYRAYS_HALFRES_MODE == HALFRES_CHECKERBOARD_WEIGHTED || PRIMARYRAYS_HALFRES_MODE == HALFRES_CHECKERBOARD_AVERAGE)
+	{
+		if (TextureCoord.y % 2 == 0)
+		{
+			if (TextureCoord.x % 2 == 0)
+			{
+				FinalColor = Color0;
+			}
+			else
+			{
+				FinalColor = GetReconstructedColor(InputColor, TextureCoord);
+			}
+		}
+		else
+		{
+			if (TextureCoord.x % 2 == 1)
+			{
+				FinalColor = Color0;
+			}
+			else
+			{
+				FinalColor = GetReconstructedColor(InputColor, TextureCoord);
+			}
+		}
+	}
+#endif
+	OutputColor[TextureCoord] = FinalColor;
+}
+
+
+float GetReflectionColorWeight(int Stencil, int GBufferStencil, float HitDist, float aveHitDist, float ColorLen, float aveColorLen)
+{
+	float Weight = GSmallNumber;
+
+	if (Stencil > 0 && Stencil == GBufferStencil)
+	{
+		float ColorWeight = 1.0f / (abs(HitDist - aveHitDist) + GSmallNumber);
+		ColorWeight *= 1.0f / (abs(ColorLen - aveColorLen) + GSmallNumber);
+
+		Weight += ColorWeight;
+	}
+
+	return Weight;
+}
+
+float4 GetReconstructedReflectionColor(in Texture2D<float4> InputTex, uint2 TextureCoord)
+{
+	float4 FinalColor = float4(0, 0, 0, -1);
+	float SumWeight = 0;
+
+	float4 ReconstructionData = GetRecoveredTextureCoordAndHitDistance(TextureCoord);
+	float3 RecoveredTextureCoord = ReconstructionData.xyz;
+	int2 GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+
+	int Stencil = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+	float4 Data0 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET0, 0));
+	float4 Data1 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET1, 0));
+	float4 Data2 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET2, 0));
+	float4 Data3 = InputTex.Load(int3(TextureCoord + TEXCOORD_OFFSET3, 0));
+
+	float MaxHitDistance = max(Data0.w, max(Data1.w, max(Data2.w, Data3.w)));
+	float MinHitDistance = min(Data0.w, min(Data1.w, min(Data2.w, Data3.w)));
+	float HitDistance = 0.5f * (Data0.w + Data1.w + Data2.w + Data3.w - MaxHitDistance - MinHitDistance);
+
+	float ColorLength0 = length(Data0.xyz);
+	float ColorLength1 = length(Data1.xyz);
+	float ColorLength2 = length(Data2.xyz);
+	float ColorLength3 = length(Data3.xyz);
+
+	float MaxColorLength = max(ColorLength0, max(ColorLength1, max(ColorLength2, ColorLength3)));
+	float MinColorLength = min(ColorLength0, min(ColorLength1, min(ColorLength2, ColorLength3)));
+	float HitColorLength = 0.5f * (ColorLength0 + ColorLength1 + ColorLength2 + ColorLength3 - MaxColorLength - MinColorLength);
+
+	ReconstructionData = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET0, 0));
+	RecoveredTextureCoord = ReconstructionData.xyz;
+	GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+	int Stencil0 = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+	ReconstructionData = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET1, 0));
+	RecoveredTextureCoord = ReconstructionData.xyz;
+	GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+	int Stencil1 = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+	ReconstructionData = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET2, 0));
+	RecoveredTextureCoord = ReconstructionData.xyz;
+	GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+	int Stencil2 = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+	ReconstructionData = ReconstructionInfo.Load(int3(TextureCoord + TEXCOORD_OFFSET3, 0));
+	RecoveredTextureCoord = ReconstructionData.xyz;
+	GBufferTextureCoord = (RecoveredTextureCoord.z > 0 && USE_RECOVERED_TEXCOORD) ? ROUND_TEXCOORD(RecoveredTextureCoord.xy) : TextureCoord;
+	int Stencil3 = SceneStencilTexture.Load(int3(GBufferTextureCoord, 0)) STENCIL_COMPONENT_SWIZZLE;
+
+	float Weight0 = GetReflectionColorWeight(Stencil0, Stencil, Data0.w, HitDistance, ColorLength0, HitColorLength);
+	float Weight1 = GetReflectionColorWeight(Stencil1, Stencil, Data1.w, HitDistance, ColorLength1, HitColorLength);
+	float Weight2 = GetReflectionColorWeight(Stencil2, Stencil, Data2.w, HitDistance, ColorLength2, HitColorLength);
+	float Weight3 = GetReflectionColorWeight(Stencil3, Stencil, Data3.w, HitDistance, ColorLength3, HitColorLength);
+
+	FinalColor.xyz = Data0.xyz * Weight0 + Data1.xyz * Weight1 + Data2.xyz * Weight2 + Data3.xyz * Weight3;
+	SumWeight = Weight0 + Weight1 + Weight2 + Weight3;
+
+	if (SumWeight > 0)
+	{
+		FinalColor /= SumWeight;
+	}
+
+	return FinalColor;
+}
+
+[numthreads(32, 32, 1)]
+void ReconstructSeparateTranslucencyReflection_CS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint2 TextureCoord = DTid.xy;
+
+	float4 Color0 = InputColor.Load(int3(TextureCoord, 0));
+
+	float4 FinalColor = 0;
+
+	// checkerboard
+	{
+		if (TextureCoord.y % 2 == 0)
+		{
+			if (TextureCoord.x % 2 == 0)
+			{
+				FinalColor = Color0;
+			}
+			else
+			{
+				FinalColor = GetReconstructedReflectionColor(InputColor, TextureCoord);
+			}
+		}
+		else
+		{
+			if (TextureCoord.x % 2 == 1)
+			{
+				FinalColor = Color0;
+			}
+			else
+			{
+				FinalColor = GetReconstructedReflectionColor(InputColor, TextureCoord);
+			}
+		}
+	}
+
+	OutputColor[TextureCoord] = FinalColor;
+}
+
+Texture2D<float4> InputReflectionColor;
+[numthreads(32, 32, 1)]
+void CompositeTranslucencyReflection_CS(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint2 TextureCoord = DTid.xy;
+
+	float4 Color = InputColor.Load(int3(TextureCoord, 0));
+
+	Color.xyz += InputReflectionColor.Load(int3(TextureCoord, 0)).xyz;
+	Color.xyz = ClampToHalfFloatRange(Color.xyz);
+
+	OutputColor[TextureCoord] = Color;
+}

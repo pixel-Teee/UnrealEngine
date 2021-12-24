@@ -1,0 +1,167 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../HairStrands/HairStrandsVoxelPageCommonStruct.ush"
+#include "../Common.ush"
+
+#define SUPPORT_CONTACT_SHADOWS		0
+#define USE_SOURCE_TEXTURE			1
+#define USE_SOURCE_TEXTURE_ARRAY	1
+
+#define LTCMatTexture				RaytracingLightsDataPacked.LTCMatTexture
+#define LTCMatSampler				GlobalBilinearClampedSampler
+#define LTCAmpTexture				RaytracingLightsDataPacked.LTCAmpTexture
+#define LTCAmpSampler				GlobalBilinearClampedSampler
+#define PreIntegratedGF				ReflectionStruct.PreIntegratedGF
+#define PreIntegratedGFSampler		GlobalBilinearClampedSampler
+
+#include "../DeferredShadingCommon.ush"
+#include "../DeferredLightingCommon.ush"
+#include "../LightShaderParameters.ush"
+#include "../SceneTextureParameters.ush"
+
+#include "RayTracingCommon.ush"
+#include "RayTracingDeferredShadingCommon.ush"
+#include "RayTracingHitGroupCommon.ush"
+#include "RayTracingDirectionalLight.ush"
+#include "RayTracingRectLight.ush"
+#include "RayTracingSphereLight.ush"
+#include "RayTracingSpotLight.ush"
+#include "RayTracingPointLight.ush"
+#include "RayTracingLightingCommon.ush"
+#include "RayTracingReflectionsCommon.ush"
+#include "RayTracingReflectionEnvironment.ush"
+
+#include "RayTracingTimingCommon.ush"
+
+uint ReflectedShadowsType;
+uint ShouldDoDirectLighting;
+uint ShouldDoEmissiveAndIndirectLighting;
+uint ReflectionEnableTwoSidedGeometry;
+float RoughnessMultiplier;
+float ShadowMaxNormalBias;
+uint2 CaptureIndexRange;    // x = start index,  y = num indices
+uint2 CubeFaceRange;		// x = start index,  y = num indices
+uint3 RayIndexOffsetScale;	// x = x offset, y = y offset, z = scale
+
+/** 
+ * X = 1 if capturing reflection capture with MaxDistance fade, 0 otherwise, 
+ * Y = Sky distance threshold, 
+ * Z = Unused
+ */
+float3 SkyLightCaptureParameters;
+
+RaytracingAccelerationStructure TLAS;
+
+// Material buffer and sort tile size are used for sorted materials.
+RWStructuredBuffer<FDeferredMaterialPayload> MaterialBuffer;
+
+RWTextureCube<float4> CaptureColorOutput;
+
+RAY_TRACING_ENTRY_RAYGEN(RayTracingReflectionProbesRGS)
+{
+	uint2 FaceCoord = DispatchRaysIndex().xy * RayIndexOffsetScale.zz + RayIndexOffsetScale.xy;
+
+	float2 UV = float2(2.0, 2.0) * (float2)FaceCoord / (float2)(DispatchRaysDimensions().xy * RayIndexOffsetScale.zz) - float2(1.0, 1.0);
+	const float3 CubeCoords[6] =
+	{
+		float3( 1.0,  -UV.y, -UV.x),
+		float3(-1.0,  -UV.y,  UV.x),
+		float3( UV.x,  1.0,   UV.y),
+		float3( UV.x, -1.0,  -UV.y),
+		float3( UV.x, -UV.y,  1.0),
+		float3(-UV.x, -UV.y, -1.0)
+	};
+
+	for(uint CaptureIndex = CaptureIndexRange.x; CaptureIndex < CaptureIndexRange.x + CaptureIndexRange.y; CaptureIndex++)
+	{
+		float4 CapturePositionAndRadius = ReflectionCapture.PositionAndRadius[CaptureIndex];
+		float4 CaptureProperties = ReflectionCapture.CaptureProperties[CaptureIndex];
+
+		for(uint SelectedCubeFace = CubeFaceRange.x; SelectedCubeFace < CubeFaceRange.x + CubeFaceRange.y; SelectedCubeFace++)
+		{
+			RayDesc EnvRay;
+			EnvRay.TMin = 0.0;
+			EnvRay.TMax = 1e27f;
+			EnvRay.Origin = CapturePositionAndRadius.xyz;
+			EnvRay.Direction = normalize(CubeCoords[SelectedCubeFace]);
+
+			const bool bSkyLightAffectReflection = ShouldSkyLightAffectReflection();
+			const bool bRayTraceSkyLightContribution = false; // bSkyLightAffectReflection; // This makes the reflection very noisy
+
+			const uint RayFlags = !ReflectionEnableTwoSidedGeometry ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+			const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+			const bool bEnableSkyLightContribution = bSkyLightAffectReflection;
+
+			// Indicates that decoupled sky light visibility ray direction generation should be used
+			const bool bDecoupleSampleGeneration = false; //SkyLightDecoupleSampleGeneration != 0;
+
+			uint DummySampleOffset = 0;
+			FRayCone RayCone = (FRayCone)0;
+
+			uint2 PixelCoord = FaceCoord;
+			uint LinearIndex = PixelCoord.y * View.BufferSizeAndInvSize.x + PixelCoord.x; // TODO(Denoiser): PixelCoord or DispatchThreadId
+
+			RandomSequence RandSequence;
+			RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex + DummySampleOffset * 16);
+
+			float3 Radiance = float3(0.0, 0.0, 0.0);
+
+			FMaterialClosestHitPayload BottomLayerPayload = TraceRayAndAccumulateBottomLayerResults(
+				EnvRay,
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				RandSequence,
+				PixelCoord,
+				ShadowMaxNormalBias,
+				ReflectedShadowsType,
+				ShouldDoDirectLighting,
+				ShouldDoEmissiveAndIndirectLighting,
+				bRayTraceSkyLightContribution,
+				bDecoupleSampleGeneration,
+				RayCone,
+				bEnableSkyLightContribution,
+				Radiance);
+
+			// Distance and sky: similar processing to main ray.
+			float BottomLayerHitDistance = -1;
+			bool IsBottomSampleValid = false;
+			if (BottomLayerPayload.IsHit())
+			{
+				IsBottomSampleValid = true;
+				BottomLayerHitDistance = BottomLayerPayload.HitT;
+			}
+			else if (bSkyLightAffectReflection && ReflectionStruct.SkyLightParameters.y > 0 && SkyLightCaptureParameters.x != 1)
+			{
+				IsBottomSampleValid = true;
+				float SkyAverageBrightness = 1.0f;
+				const float DummyRoughness = 0.0;
+				float3 SkyLighting = GetSkyLightReflection(EnvRay.Direction, DummyRoughness, SkyAverageBrightness);
+				Radiance += SkyLighting;
+				BottomLayerHitDistance = 1.0e20;
+			}
+			else if(SkyLightCaptureParameters.x == 1)
+			{
+				BottomLayerHitDistance = 1.0e20;
+			}
+
+			float Alpha = 1.0f;
+			if (SkyLightCaptureParameters.x == 1)
+			{
+				float MaxDistance = SkyLightCaptureParameters.y;
+
+				// Setup alpha to fade out smoothly past the max distance
+				// This allows a local reflection capture to only provide reflections where it has valid data, falls back to sky cubemap
+				Alpha = 1 - smoothstep(.8f * MaxDistance, MaxDistance, BottomLayerHitDistance);
+
+				// Premultiply
+				Radiance *= Alpha;
+			}
+
+			float CaptureArrayIndex = CaptureProperties.g;
+
+			float4 OutColor = float4(Radiance / CaptureProperties.r, Alpha);
+			CaptureColorOutput[uint3(FaceCoord, 6 * CaptureArrayIndex + SelectedCubeFace)] = OutColor;
+		}
+	}
+}
